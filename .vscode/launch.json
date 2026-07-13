@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:GeoSyncBackend}",
+            "name": "Debug GeoSyncBackend",
+            "target": "GeoSyncBackend",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug GeoSyncBackend"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:GeoSyncBackend}",
+            "name": "Release GeoSyncBackend",
+            "target": "GeoSyncBackend",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release GeoSyncBackend"
+        }
+    ]
+}
