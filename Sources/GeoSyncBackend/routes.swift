@@ -29,6 +29,7 @@ private struct StoredLocation: Content {
     let longitude: Double
     let timestamp: String?
     let receivedAt: String
+    let isOnline: Bool
 }
 
 private struct ServerEvent: Content {
@@ -69,11 +70,29 @@ private final class LiveLocationHub: @unchecked Sendable {
 
     private let state = NIOLockedValueBox(State())
 
-    func registerClient(connectionId: UUID, clientId: UUID) -> Bool {
+    func registerClient(connectionId: UUID, clientId: UUID) -> (Bool, [(WebSocket, ServerEvent)]) {
         self.state.withLockedValue { state in
-            guard state.admins[connectionId] == nil, state.clientByConnection[connectionId] == nil else { return false }
+            guard state.admins[connectionId] == nil, state.clientByConnection[connectionId] == nil else { return (false, []) }
             state.clientByConnection[connectionId] = clientId
-            return true
+            
+            // If we have a previous location, update it to online
+            var events: [(WebSocket, ServerEvent)] = []
+            if var location = state.latestLocations[clientId] {
+                location = StoredLocation(
+                    clientId: clientId,
+                    latitude: location.latitude,
+                    longitude: location.longitude,
+                    timestamp: location.timestamp,
+                    receivedAt: location.receivedAt,
+                    isOnline: true
+                )
+                state.latestLocations[clientId] = location
+                let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
+                events = state.admins.values
+                    .filter { $0.subscriptions.contains(clientId) }
+                    .map { ($0.socket, event) }
+            }
+            return (true, events)
         }
     }
 
@@ -103,7 +122,7 @@ private final class LiveLocationHub: @unchecked Sendable {
         }
     }
 
-    func publish(connectionId: UUID, clientId: UUID, payload: LocationPayload) -> [WebSocket]? {
+    func publish(connectionId: UUID, clientId: UUID, payload: LocationPayload) -> [(WebSocket, ServerEvent)]? {
         self.state.withLockedValue { state in
             guard state.clientByConnection[connectionId] == clientId else { return nil }
 
@@ -112,25 +131,41 @@ private final class LiveLocationHub: @unchecked Sendable {
                 latitude: payload.latitude,
                 longitude: payload.longitude,
                 timestamp: payload.timestamp,
-                receivedAt: ISO8601DateFormatter().string(from: Date())
+                receivedAt: ISO8601DateFormatter().string(from: Date()),
+                isOnline: true
             )
             state.latestLocations[clientId] = location
+            let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
+            
             return state.admins.values
                 .filter { $0.subscriptions.contains(clientId) }
-                .map(\.socket)
+                .map { ($0.socket, event) }
         }
     }
 
-    func latestLocation(for clientId: UUID) -> StoredLocation? {
-        self.state.withLockedValue { $0.latestLocations[clientId] }
-    }
-
-    func remove(connectionId: UUID) {
+    func remove(connectionId: UUID) -> [(WebSocket, ServerEvent)] {
         self.state.withLockedValue { state in
+            var events: [(WebSocket, ServerEvent)] = []
             if let clientId = state.clientByConnection.removeValue(forKey: connectionId) {
-                state.latestLocations.removeValue(forKey: clientId)
+                // When client disconnects, mark as offline but KEEP the location
+                if var location = state.latestLocations[clientId] {
+                    location = StoredLocation(
+                        clientId: clientId,
+                        latitude: location.latitude,
+                        longitude: location.longitude,
+                        timestamp: location.timestamp,
+                        receivedAt: location.receivedAt,
+                        isOnline: false
+                    )
+                    state.latestLocations[clientId] = location
+                    let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
+                    events = state.admins.values
+                        .filter { $0.subscriptions.contains(clientId) }
+                        .map { ($0.socket, event) }
+                }
             }
             state.admins.removeValue(forKey: connectionId)
+            return events
         }
     }
 }
@@ -166,7 +201,8 @@ func routes(_ app: Application) throws {
         send(ServerEvent(type: "connected", message: "Register as client or admin before sending other messages."), to: socket)
 
         socket.onClose.whenComplete { _ in
-            hub.remove(connectionId: connectionId)
+            let events = hub.remove(connectionId: connectionId)
+            events.forEach { send($0.1, to: $0.0) }
         }
 
         socket.onText { socket, text in
@@ -184,11 +220,13 @@ func routes(_ app: Application) throws {
                     send(ServerEvent(type: "error", message: "clientId is required."), to: socket)
                     return
                 }
-                guard hub.registerClient(connectionId: connectionId, clientId: clientId) else {
+                let (success, events) = hub.registerClient(connectionId: connectionId, clientId: clientId)
+                guard success else {
                     send(ServerEvent(type: "error", message: "This socket already has a different role."), to: socket)
                     return
                 }
                 send(ServerEvent(type: "client.registered", clientId: clientId), to: socket)
+                events.forEach { send($0.1, to: $0.0) }
 
             case "client.location":
                 guard let clientId = incoming.clientId,
@@ -202,13 +240,11 @@ func routes(_ app: Application) throws {
                 }
 
                 let payload = LocationPayload(latitude: latitude, longitude: longitude, timestamp: incoming.timestamp)
-                guard let recipients = hub.publish(connectionId: connectionId, clientId: clientId, payload: payload) else {
+                guard let events = hub.publish(connectionId: connectionId, clientId: clientId, payload: payload) else {
                     send(ServerEvent(type: "error", message: "Register this clientId on this socket before publishing."), to: socket)
                     return
                 }
-                guard let location = hub.latestLocation(for: clientId) else { return }
-                let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
-                recipients.forEach { send(event, to: $0) }
+                events.forEach { send($0.1, to: $0.0) }
 
             case "admin.register":
                 guard hub.registerAdmin(connectionId: connectionId, socket: socket) else {
