@@ -38,19 +38,22 @@ private struct ServerEvent: Content {
     let clientIds: [UUID]?
     let location: StoredLocation?
     let message: String?
+    let subscribersCount: Int?
 
     init(
         type: String,
         clientId: UUID? = nil,
         clientIds: [UUID]? = nil,
         location: StoredLocation? = nil,
-        message: String? = nil
+        message: String? = nil,
+        subscribersCount: Int? = nil
     ) {
         self.type = type
         self.clientId = clientId
         self.clientIds = clientIds
         self.location = location
         self.message = message
+        self.subscribersCount = subscribersCount
     }
 }
 
@@ -64,19 +67,25 @@ private final class LiveLocationHub: @unchecked Sendable {
 
     private struct State {
         var clientByConnection: [UUID: UUID] = [:]
+        var clientSockets: [UUID: WebSocket] = [:]
         var admins: [UUID: AdminConnection] = [:]
         var latestLocations: [UUID: StoredLocation] = [:]
     }
 
     private let state = NIOLockedValueBox(State())
 
-    func registerClient(connectionId: UUID, clientId: UUID) -> (Bool, [(WebSocket, ServerEvent)]) {
+    func registerClient(connectionId: UUID, clientId: UUID, socket: WebSocket) -> (Bool, [(WebSocket, ServerEvent)]) {
         self.state.withLockedValue { state in
             guard state.admins[connectionId] == nil, state.clientByConnection[connectionId] == nil else { return (false, []) }
             state.clientByConnection[connectionId] = clientId
+            state.clientSockets[connectionId] = socket
             
+            // Initial subscriber count for the new client
+            let subscribersCount = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
+            let registrationEvent = (socket, ServerEvent(type: "client.subscribers", subscribersCount: subscribersCount))
+
             // If we have a previous location, update it to online
-            var events: [(WebSocket, ServerEvent)] = []
+            var events: [(WebSocket, ServerEvent)] = [registrationEvent]
             if var location = state.latestLocations[clientId] {
                 location = StoredLocation(
                     clientId: clientId,
@@ -88,9 +97,9 @@ private final class LiveLocationHub: @unchecked Sendable {
                 )
                 state.latestLocations[clientId] = location
                 let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
-                events = state.admins.values
+                events.append(contentsOf: state.admins.values
                     .filter { $0.subscriptions.contains(clientId) }
-                    .map { ($0.socket, event) }
+                    .map { ($0.socket, event) })
             }
             return (true, events)
         }
@@ -104,21 +113,43 @@ private final class LiveLocationHub: @unchecked Sendable {
         }
     }
 
-    func subscribe(connectionId: UUID, clientIds: [UUID]) -> [StoredLocation]? {
+    func subscribe(connectionId: UUID, clientIds: [UUID]) -> ([StoredLocation], [(WebSocket, ServerEvent)])? {
         self.state.withLockedValue { state in
             guard var admin = state.admins[connectionId] else { return nil }
+            let newClientIds = Set(clientIds).subtracting(admin.subscriptions)
             admin.subscriptions.formUnion(clientIds)
             state.admins[connectionId] = admin
-            return clientIds.compactMap { state.latestLocations[$0] }
+            
+            let locations = clientIds.compactMap { state.latestLocations[$0] }
+            
+            // Notify clients about new subscribers
+            let notifications = newClientIds.compactMap { clientId -> (WebSocket, ServerEvent)? in
+                guard let connId = state.clientByConnection.first(where: { $0.value == clientId })?.key,
+                      let socket = state.clientSockets[connId] else { return nil }
+                let count = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
+                return (socket, ServerEvent(type: "client.subscribers", subscribersCount: count))
+            }
+            
+            return (locations, notifications)
         }
     }
 
-    func unsubscribe(connectionId: UUID, clientIds: [UUID]) -> Bool {
+    func unsubscribe(connectionId: UUID, clientIds: [UUID]) -> [(WebSocket, ServerEvent)]? {
         self.state.withLockedValue { state in
-            guard var admin = state.admins[connectionId] else { return false }
+            guard var admin = state.admins[connectionId] else { return nil }
+            let removedClientIds = Set(clientIds).intersection(admin.subscriptions)
             admin.subscriptions.subtract(clientIds)
             state.admins[connectionId] = admin
-            return true
+            
+            // Notify clients about unsubscribed admin
+            let notifications = removedClientIds.compactMap { clientId -> (WebSocket, ServerEvent)? in
+                guard let connId = state.clientByConnection.first(where: { $0.value == clientId })?.key,
+                      let socket = state.clientSockets[connId] else { return nil }
+                let count = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
+                return (socket, ServerEvent(type: "client.subscribers", subscribersCount: count))
+            }
+            
+            return notifications
         }
     }
 
@@ -146,7 +177,9 @@ private final class LiveLocationHub: @unchecked Sendable {
     func remove(connectionId: UUID) -> [(WebSocket, ServerEvent)] {
         self.state.withLockedValue { state in
             var events: [(WebSocket, ServerEvent)] = []
+            
             if let clientId = state.clientByConnection.removeValue(forKey: connectionId) {
+                state.clientSockets.removeValue(forKey: connectionId)
                 // When client disconnects, mark as offline but KEEP the location
                 if var location = state.latestLocations[clientId] {
                     location = StoredLocation(
@@ -164,7 +197,18 @@ private final class LiveLocationHub: @unchecked Sendable {
                         .map { ($0.socket, event) }
                 }
             }
-            state.admins.removeValue(forKey: connectionId)
+            
+            if let admin = state.admins.removeValue(forKey: connectionId) {
+                // Notify clients that this admin was watching
+                for clientId in admin.subscriptions {
+                    if let connId = state.clientByConnection.first(where: { $0.value == clientId })?.key,
+                       let socket = state.clientSockets[connId] {
+                        let count = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
+                        events.append((socket, ServerEvent(type: "client.subscribers", subscribersCount: count)))
+                    }
+                }
+            }
+            
             return events
         }
     }
@@ -220,7 +264,7 @@ func routes(_ app: Application) throws {
                     send(ServerEvent(type: "error", message: "clientId is required."), to: socket)
                     return
                 }
-                let (success, events) = hub.registerClient(connectionId: connectionId, clientId: clientId)
+                let (success, events) = hub.registerClient(connectionId: connectionId, clientId: clientId, socket: socket)
                 guard success else {
                     send(ServerEvent(type: "error", message: "This socket already has a different role."), to: socket)
                     return
@@ -258,25 +302,28 @@ func routes(_ app: Application) throws {
                     send(ServerEvent(type: "error", message: "clientIds must contain at least one UUID."), to: socket)
                     return
                 }
-                guard let cachedLocations = hub.subscribe(connectionId: connectionId, clientIds: clientIds) else {
+                guard let result = hub.subscribe(connectionId: connectionId, clientIds: clientIds) else {
                     send(ServerEvent(type: "error", message: "Register as admin before subscribing."), to: socket)
                     return
                 }
+                let (cachedLocations, notifications) = result
                 send(ServerEvent(type: "admin.subscribed", clientIds: clientIds), to: socket)
                 cachedLocations.forEach { location in
                     send(ServerEvent(type: "location.update", clientId: location.clientId, location: location), to: socket)
                 }
+                notifications.forEach { send($0.1, to: $0.0) }
 
             case "admin.unsubscribe":
                 guard let clientIds = incoming.clientIds, !clientIds.isEmpty else {
                     send(ServerEvent(type: "error", message: "clientIds must contain at least one UUID."), to: socket)
                     return
                 }
-                guard hub.unsubscribe(connectionId: connectionId, clientIds: clientIds) else {
+                guard let notifications = hub.unsubscribe(connectionId: connectionId, clientIds: clientIds) else {
                     send(ServerEvent(type: "error", message: "Register as admin before unsubscribing."), to: socket)
                     return
                 }
                 send(ServerEvent(type: "admin.unsubscribed", clientIds: clientIds), to: socket)
+                notifications.forEach { send($0.1, to: $0.0) }
 
             default:
                 send(ServerEvent(type: "error", message: "Unknown message type: \(incoming.type)."), to: socket)
