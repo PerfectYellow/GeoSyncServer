@@ -1,5 +1,7 @@
 import NIOConcurrencyHelpers
 import Vapor
+import Fluent
+import FluentSQLiteDriver
 
 /// The JSON object sent by a client when publishing its position.
 struct LocationPayload: Content {
@@ -229,8 +231,22 @@ private func send(_ event: ServerEvent, to socket: WebSocket) {
     }
 }
 
+extension DatabaseID {
+    static let mbtiles = DatabaseID(string: "mbtiles")
+}
+
 func routes(_ app: Application) throws {
     let hub = LiveLocationHub()
+
+    // --- MBTiles Setup ---
+    let mbtilesPath = "osm-2020-02-10-v3.11_iran_tehran.mbtiles"
+    let fileManager = FileManager.default
+    if fileManager.fileExists(atPath: mbtilesPath) {
+        print("✅ MBTiles file found at: \(mbtilesPath)")
+    } else {
+        print("❌ MBTiles file NOT found at: \(mbtilesPath). Currently in: \(fileManager.currentDirectoryPath)")
+    }
+    app.databases.use(.sqlite(.file(mbtilesPath)), as: .mbtiles)
 
     app.get { _ in
         "GeoSync live-location relay is running. Connect with WebSocket at /v1/live."
@@ -238,6 +254,105 @@ func routes(_ app: Application) throws {
 
     app.get("health") { _ in
         ["status": "ok"]
+    }
+
+    // --- Internal Map Tile Server ---
+    app.get("v1", "map", "tiles", ":z", ":x", ":y") { req -> EventLoopFuture<Response> in
+        guard let z = req.parameters.get("z", as: Int.self),
+              let x = req.parameters.get("x", as: Int.self),
+              let y = req.parameters.get("y", as: Int.self) else {
+            return req.eventLoop.makeFailedFuture(Abort(.badRequest))
+        }
+
+        // MBTiles uses TMS (Tile Map Service) coordinates, so we must flip the Y axis
+        let y_tms = Int(pow(2.0, Double(z))) - 1 - y
+
+        let db = req.db(.mbtiles) as! (any SQLiteDatabase)
+        let query = "SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?"
+        
+        return db.query(query, [
+            SQLiteData.integer(z),
+            SQLiteData.integer(x),
+            SQLiteData.integer(y_tms)
+        ]).map { rows in
+            guard let row = rows.first,
+                  let tileData = row.column("tile_data")?.blob else {
+                return Response(status: .notFound)
+            }
+            
+            let response = Response(status: .ok, body: .init(buffer: tileData))
+            // Your metadata says 'format: pbf', which means Vector Tiles.
+            response.headers.replaceOrAdd(name: .contentType, value: "application/x-protobuf")
+            // Vector tiles in MBTiles are often gzipped. MapLibre expects this.
+            response.headers.replaceOrAdd(name: .contentEncoding, value: "gzip")
+            return response
+        }
+    }
+
+    // Simple Mapbox Style for Internal Vector Tiles
+    app.get("v1", "map", "style.json") { req -> Response in
+        let host = req.headers.first(name: .host) ?? "localhost:8080"
+        let scheme = req.application.http.server.configuration.tlsConfiguration == nil ? "http" : "https"
+        
+        let style = """
+        {
+          "version": 8,
+          "name": "GeoSync Internal",
+          "sources": {
+            "internal": {
+              "type": "vector",
+              "tiles": ["\(scheme)://\(host)/v1/map/tiles/{z}/{x}/{y}"],
+              "minzoom": 0,
+              "maxzoom": 14
+            }
+          },
+          "layers": [
+            {
+              "id": "background",
+              "type": "background",
+              "paint": { "background-color": "#f8f4f0" }
+            },
+            {
+              "id": "water",
+              "source": "internal",
+              "source-layer": "water",
+              "type": "fill",
+              "paint": { "fill-color": "#a0cfdf" }
+            },
+            {
+              "id": "roads",
+              "source": "internal",
+              "source-layer": "transportation",
+              "type": "line",
+              "paint": { "line-color": "#ffffff", "line-width": 1 }
+            },
+            {
+              "id": "buildings",
+              "source": "internal",
+              "source-layer": "building",
+              "type": "fill",
+              "paint": { "fill-color": "#dcdcdc" }
+            }
+          ]
+        }
+        """
+        var headers = HTTPHeaders()
+        headers.add(name: .contentType, value: "application/json")
+        return Response(status: .ok, headers: headers, body: .init(string: style))
+    }
+
+    // Diagnostic route to check map metadata
+    app.get("v1", "map", "metadata") { req -> EventLoopFuture<[String: String]> in
+        let db = req.db(.mbtiles) as! (any SQLiteDatabase)
+        return db.query("SELECT name, value FROM metadata").map { rows in
+            var metadata: [String: String] = [:]
+            for row in rows {
+                if let name = row.column("name")?.string, let value = row.column("value")?.string {
+                    metadata[name] = value
+                }
+            }
+            return metadata
+        }
     }
 
     app.webSocket("v1", "live") { _, socket in
