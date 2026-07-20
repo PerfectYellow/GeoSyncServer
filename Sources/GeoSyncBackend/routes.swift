@@ -17,8 +17,8 @@ struct LocationPayload: Content {
 /// the protocol straightforward to use from Swift, Kotlin, JavaScript, and other clients.
 struct LiveLocationMessage: Content {
     let type: String
-    let clientId: UUID?
-    let clientIds: [UUID]?
+    let clientId: String?
+    let clientIds: [String]?
     let latitude: Double?
     let longitude: Double?
     let timestamp: String?
@@ -26,7 +26,7 @@ struct LiveLocationMessage: Content {
 }
 
 private struct StoredLocation: Content {
-    let clientId: UUID
+    let clientId: String
     let latitude: Double
     let longitude: Double
     let timestamp: String?
@@ -36,16 +36,16 @@ private struct StoredLocation: Content {
 
 private struct ServerEvent: Content {
     let type: String
-    let clientId: UUID?
-    let clientIds: [UUID]?
+    let clientId: String?
+    let clientIds: [String]?
     let location: StoredLocation?
     let message: String?
     let subscribersCount: Int?
 
     init(
         type: String,
-        clientId: UUID? = nil,
-        clientIds: [UUID]? = nil,
+        clientId: String? = nil,
+        clientIds: [String]? = nil,
         location: StoredLocation? = nil,
         message: String? = nil,
         subscribersCount: Int? = nil
@@ -64,19 +64,19 @@ private struct ServerEvent: Content {
 private final class LiveLocationHub: @unchecked Sendable {
     private struct AdminConnection {
         let socket: WebSocket
-        var subscriptions: Set<UUID>
+        var subscriptions: Set<String>
     }
 
     private struct State {
-        var clientByConnection: [UUID: UUID] = [:]
+        var clientByConnection: [UUID: String] = [:]
         var clientSockets: [UUID: WebSocket] = [:]
         var admins: [UUID: AdminConnection] = [:]
-        var latestLocations: [UUID: StoredLocation] = [:]
+        var latestLocations: [String: StoredLocation] = [:]
     }
 
     private let state = NIOLockedValueBox(State())
 
-    func registerClient(connectionId: UUID, clientId: UUID, socket: WebSocket) -> (Bool, [(WebSocket, ServerEvent)]) {
+    func registerClient(connectionId: UUID, clientId: String, socket: WebSocket) -> (Bool, [(WebSocket, ServerEvent)]) {
         self.state.withLockedValue { state in
             guard state.admins[connectionId] == nil, state.clientByConnection[connectionId] == nil else { return (false, []) }
             state.clientByConnection[connectionId] = clientId
@@ -115,7 +115,7 @@ private final class LiveLocationHub: @unchecked Sendable {
         }
     }
 
-    func subscribe(connectionId: UUID, clientIds: [UUID]) -> ([StoredLocation], [(WebSocket, ServerEvent)])? {
+    func subscribe(connectionId: UUID, clientIds: [String]) -> ([StoredLocation], [(WebSocket, ServerEvent)])? {
         self.state.withLockedValue { state in
             guard var admin = state.admins[connectionId] else { return nil }
             let newClientIds = Set(clientIds).subtracting(admin.subscriptions)
@@ -136,7 +136,7 @@ private final class LiveLocationHub: @unchecked Sendable {
         }
     }
 
-    func unsubscribe(connectionId: UUID, clientIds: [UUID]) -> [(WebSocket, ServerEvent)]? {
+    func unsubscribe(connectionId: UUID, clientIds: [String]) -> [(WebSocket, ServerEvent)]? {
         self.state.withLockedValue { state in
             guard var admin = state.admins[connectionId] else { return nil }
             let removedClientIds = Set(clientIds).intersection(admin.subscriptions)
@@ -155,7 +155,7 @@ private final class LiveLocationHub: @unchecked Sendable {
         }
     }
 
-    func publish(connectionId: UUID, clientId: UUID, payload: LocationPayload) -> [(WebSocket, ServerEvent)]? {
+    func publish(connectionId: UUID, clientId: String, payload: LocationPayload) -> [(WebSocket, ServerEvent)]? {
         self.state.withLockedValue { state in
             guard state.clientByConnection[connectionId] == clientId else { return nil }
 
@@ -414,7 +414,7 @@ func routes(_ app: Application) throws {
 
             case "admin.subscribe":
                 guard let clientIds = incoming.clientIds, !clientIds.isEmpty else {
-                    send(ServerEvent(type: "error", message: "clientIds must contain at least one UUID."), to: socket)
+                    send(ServerEvent(type: "error", message: "clientIds must contain at least one ID."), to: socket)
                     return
                 }
                 guard let result = hub.subscribe(connectionId: connectionId, clientIds: clientIds) else {
@@ -430,7 +430,7 @@ func routes(_ app: Application) throws {
 
             case "admin.unsubscribe":
                 guard let clientIds = incoming.clientIds, !clientIds.isEmpty else {
-                    send(ServerEvent(type: "error", message: "clientIds must contain at least one UUID."), to: socket)
+                    send(ServerEvent(type: "error", message: "clientIds must contain at least one ID."), to: socket)
                     return
                 }
                 guard let notifications = hub.unsubscribe(connectionId: connectionId, clientIds: clientIds) else {
