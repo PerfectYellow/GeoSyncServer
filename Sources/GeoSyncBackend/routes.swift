@@ -81,7 +81,7 @@ private final class LiveLocationHub: @unchecked Sendable {
             guard state.admins[connectionId] == nil, state.clientByConnection[connectionId] == nil else { return (false, []) }
             state.clientByConnection[connectionId] = clientId
             state.clientSockets[connectionId] = socket
-            
+
             // Initial subscriber count for the new client
             let subscribersCount = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
             let registrationEvent = (socket, ServerEvent(type: "client.subscribers", subscribersCount: subscribersCount))
@@ -100,8 +100,8 @@ private final class LiveLocationHub: @unchecked Sendable {
                 state.latestLocations[clientId] = location
                 let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
                 events.append(contentsOf: state.admins.values
-                    .filter { $0.subscriptions.contains(clientId) }
-                    .map { ($0.socket, event) })
+                .filter { $0.subscriptions.contains(clientId) }
+                .map { ($0.socket, event) })
             }
             return (true, events)
         }
@@ -121,9 +121,9 @@ private final class LiveLocationHub: @unchecked Sendable {
             let newClientIds = Set(clientIds).subtracting(admin.subscriptions)
             admin.subscriptions.formUnion(clientIds)
             state.admins[connectionId] = admin
-            
+
             let locations = clientIds.compactMap { state.latestLocations[$0] }
-            
+
             // Notify clients about new subscribers
             let notifications = newClientIds.compactMap { clientId -> (WebSocket, ServerEvent)? in
                 guard let connId = state.clientByConnection.first(where: { $0.value == clientId })?.key,
@@ -131,7 +131,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                 let count = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
                 return (socket, ServerEvent(type: "client.subscribers", subscribersCount: count))
             }
-            
+
             return (locations, notifications)
         }
     }
@@ -142,7 +142,7 @@ private final class LiveLocationHub: @unchecked Sendable {
             let removedClientIds = Set(clientIds).intersection(admin.subscriptions)
             admin.subscriptions.subtract(clientIds)
             state.admins[connectionId] = admin
-            
+
             // Notify clients about unsubscribed admin
             let notifications = removedClientIds.compactMap { clientId -> (WebSocket, ServerEvent)? in
                 guard let connId = state.clientByConnection.first(where: { $0.value == clientId })?.key,
@@ -150,7 +150,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                 let count = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
                 return (socket, ServerEvent(type: "client.subscribers", subscribersCount: count))
             }
-            
+
             return notifications
         }
     }
@@ -169,17 +169,17 @@ private final class LiveLocationHub: @unchecked Sendable {
             )
             state.latestLocations[clientId] = location
             let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
-            
+
             return state.admins.values
-                .filter { $0.subscriptions.contains(clientId) }
-                .map { ($0.socket, event) }
+            .filter { $0.subscriptions.contains(clientId) }
+            .map { ($0.socket, event) }
         }
     }
 
     func remove(connectionId: UUID) -> [(WebSocket, ServerEvent)] {
         self.state.withLockedValue { state in
             var events: [(WebSocket, ServerEvent)] = []
-            
+
             if let clientId = state.clientByConnection.removeValue(forKey: connectionId) {
                 state.clientSockets.removeValue(forKey: connectionId)
                 // When client disconnects, mark as offline but KEEP the location
@@ -195,11 +195,11 @@ private final class LiveLocationHub: @unchecked Sendable {
                     state.latestLocations[clientId] = location
                     let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
                     events = state.admins.values
-                        .filter { $0.subscriptions.contains(clientId) }
-                        .map { ($0.socket, event) }
+                    .filter { $0.subscriptions.contains(clientId) }
+                    .map { ($0.socket, event) }
                 }
             }
-            
+
             if let admin = state.admins.removeValue(forKey: connectionId) {
                 // Notify clients that this admin was watching
                 for clientId in admin.subscriptions {
@@ -210,7 +210,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                     }
                 }
             }
-            
+
             return events
         }
     }
@@ -269,7 +269,7 @@ func routes(_ app: Application) throws {
 
         let db = req.db(.mbtiles) as! (any SQLiteDatabase)
         let query = "SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?"
-        
+
         return db.query(query, [
             SQLiteData.integer(z),
             SQLiteData.integer(x),
@@ -279,7 +279,7 @@ func routes(_ app: Application) throws {
                   let tileData = row.column("tile_data")?.blob else {
                 return Response(status: .notFound)
             }
-            
+
             let response = Response(status: .ok, body: .init(buffer: tileData))
             // Your metadata says 'format: pbf', which means Vector Tiles.
             response.headers.replaceOrAdd(name: .contentType, value: "application/x-protobuf")
@@ -292,50 +292,57 @@ func routes(_ app: Application) throws {
     // Simple Mapbox Style for Internal Vector Tiles
     app.get("v1", "map", "style.json") { req -> Response in
         let host = req.headers.first(name: .host) ?? "localhost:8080"
-        let scheme = req.application.http.server.configuration.tlsConfiguration == nil ? "http" : "https"
         
-        let style = """
-        {
-          "version": 8,
-          "name": "GeoSync Internal",
-          "sources": {
-            "internal": {
-              "type": "vector",
-              "tiles": ["\(scheme)://\(host)/v1/map/tiles/{z}/{x}/{y}"],
-              "minzoom": 0,
-              "maxzoom": 14
-            }
-          },
-          "layers": [
-            {
-              "id": "background",
-              "type": "background",
-              "paint": { "background-color": "#f8f4f0" }
-            },
-            {
-              "id": "water",
-              "source": "internal",
-              "source-layer": "water",
-              "type": "fill",
-              "paint": { "fill-color": "#a0cfdf" }
-            },
-            {
-              "id": "roads",
-              "source": "internal",
-              "source-layer": "transportation",
-              "type": "line",
-              "paint": { "line-color": "#ffffff", "line-width": 1 }
-            },
-            {
-              "id": "buildings",
-              "source": "internal",
-              "source-layer": "building",
-              "type": "fill",
-              "paint": { "fill-color": "#dcdcdc" }
-            }
-          ]
+        // Detect scheme robustly, especially when behind a proxy like Nginx or Cloudflare
+        var scheme = "http"
+        if let forwardedProto = req.headers.first(name: "X-Forwarded-Proto") {
+            scheme = forwardedProto
+        } else if req.application.http.server.configuration.tlsConfiguration != nil {
+            scheme = "https"
         }
-        """
+
+        let style = """
+                    {
+                      "version": 8,
+                      "name": "GeoSync Internal",
+                      "sources": {
+                        "internal": {
+                          "type": "vector",
+                          "tiles": ["\(scheme)://\(host)/v1/map/tiles/{z}/{x}/{y}"],
+                          "minzoom": 0,
+                          "maxzoom": 22
+                        }
+                      },
+                      "layers": [
+                        {
+                          "id": "background",
+                          "type": "background",
+                          "paint": { "background-color": "#f8f4f0" }
+                        },
+                        {
+                          "id": "water",
+                          "source": "internal",
+                          "source-layer": "water",
+                          "type": "fill",
+                          "paint": { "fill-color": "#a0cfdf" }
+                        },
+                        {
+                          "id": "roads",
+                          "source": "internal",
+                          "source-layer": "transportation",
+                          "type": "line",
+                          "paint": { "line-color": "#ffffff", "line-width": 2 }
+                        },
+                        {
+                          "id": "buildings",
+                          "source": "internal",
+                          "source-layer": "building",
+                          "type": "fill",
+                          "paint": { "fill-color": "#dcdcdc" }
+                        }
+                      ]
+                    }
+                    """
         var headers = HTTPHeaders()
         headers.add(name: .contentType, value: "application/json")
         return Response(status: .ok, headers: headers, body: .init(string: style))
