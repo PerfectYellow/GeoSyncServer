@@ -12,9 +12,6 @@ struct LocationPayload: Content {
 }
 
 /// One WebSocket message shape used by both mobile roles.
-///
-/// `type` determines which optional fields are required. Keeping a single envelope makes
-/// the protocol straightforward to use from Swift, Kotlin, JavaScript, and other clients.
 struct LiveLocationMessage: Content {
     let type: String
     let clientId: String?
@@ -23,6 +20,7 @@ struct LiveLocationMessage: Content {
     let longitude: Double?
     let timestamp: String?
     let message: String?
+    let sessionTag: String?
 }
 
 private struct StoredLocation: Content {
@@ -59,8 +57,7 @@ private struct ServerEvent: Content {
     }
 }
 
-/// Thread-safe, process-local relay state. It deliberately has no persistence: restarting
-/// the process clears locations and subscriptions.
+/// Thread-safe, process-local relay state.
 private final class LiveLocationHub: @unchecked Sendable {
     private struct AdminConnection {
         let socket: WebSocket
@@ -72,21 +69,31 @@ private final class LiveLocationHub: @unchecked Sendable {
         var clientSockets: [UUID: WebSocket] = [:]
         var admins: [UUID: AdminConnection] = [:]
         var latestLocations: [String: StoredLocation] = [:]
+        
+        /// Maps clientId to an active TrackingSession ID in the database.
+        var activeSessions: [String: UUID] = [:]
+        
+        /// Tracks the last saved point for throttling (to avoid DB jitter).
+        var lastSavedPoints: [String: (latitude: Double, longitude: Double, time: Date)] = [:]
     }
 
     private let state = NIOLockedValueBox(State())
+    private let db: any Database
+
+    init(db: any Database) {
+        self.db = db
+    }
 
     func registerClient(connectionId: UUID, clientId: String, socket: WebSocket) -> (Bool, [(WebSocket, ServerEvent)]) {
+        // ... (existing logic)
         self.state.withLockedValue { state in
             guard state.admins[connectionId] == nil, state.clientByConnection[connectionId] == nil else { return (false, []) }
             state.clientByConnection[connectionId] = clientId
             state.clientSockets[connectionId] = socket
 
-            // Initial subscriber count for the new client
             let subscribersCount = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
             let registrationEvent = (socket, ServerEvent(type: "client.subscribers", subscribersCount: subscribersCount))
 
-            // If we have a previous location, update it to online
             var events: [(WebSocket, ServerEvent)] = [registrationEvent]
             if var location = state.latestLocations[clientId] {
                 location = StoredLocation(
@@ -124,7 +131,6 @@ private final class LiveLocationHub: @unchecked Sendable {
 
             let locations = clientIds.compactMap { state.latestLocations[$0] }
 
-            // Notify clients about new subscribers
             let notifications = newClientIds.compactMap { clientId -> (WebSocket, ServerEvent)? in
                 guard let connId = state.clientByConnection.first(where: { $0.value == clientId })?.key,
                       let socket = state.clientSockets[connId] else { return nil }
@@ -143,7 +149,6 @@ private final class LiveLocationHub: @unchecked Sendable {
             admin.subscriptions.subtract(clientIds)
             state.admins[connectionId] = admin
 
-            // Notify clients about unsubscribed admin
             let notifications = removedClientIds.compactMap { clientId -> (WebSocket, ServerEvent)? in
                 guard let connId = state.clientByConnection.first(where: { $0.value == clientId })?.key,
                       let socket = state.clientSockets[connId] else { return nil }
@@ -156,31 +161,152 @@ private final class LiveLocationHub: @unchecked Sendable {
     }
 
     func publish(connectionId: UUID, clientId: String, payload: LocationPayload) -> [(WebSocket, ServerEvent)]? {
-        self.state.withLockedValue { state in
-            guard state.clientByConnection[connectionId] == clientId else { return nil }
+        let now = Date()
+        let result = self.state.withLockedValue { state -> (UUID?, (latitude: Double, longitude: Double, time: Date)?, [(WebSocket, ServerEvent)]?) in
+            guard state.clientByConnection[connectionId] == clientId else { return (nil, nil, nil) }
 
             let location = StoredLocation(
                 clientId: clientId,
                 latitude: payload.latitude,
                 longitude: payload.longitude,
                 timestamp: payload.timestamp,
-                receivedAt: ISO8601DateFormatter().string(from: Date()),
+                receivedAt: ISO8601DateFormatter().string(from: now),
                 isOnline: true
             )
             state.latestLocations[clientId] = location
             let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
 
-            return state.admins.values
-            .filter { $0.subscriptions.contains(clientId) }
-            .map { ($0.socket, event) }
+            let adminEvents = state.admins.values
+                .filter { $0.subscriptions.contains(clientId) }
+                .map { ($0.socket, event) }
+            
+            return (state.activeSessions[clientId], state.lastSavedPoints[clientId], adminEvents)
         }
+
+        guard let adminEvents = result.2 else { return nil }
+        
+        // --- Persistence Logic (Senior Approach: Throttling & Incremental Stats) ---
+        if let sessionId = result.0 {
+            let lastPoint = result.1
+            let currentLat = payload.latitude
+            let currentLon = payload.longitude
+            
+            var shouldSave = false
+            var distanceIncrement: Double = 0.0
+            
+            if let last = lastPoint {
+                let dist = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
+                let timeSince = now.timeIntervalSince(last.time)
+                
+                // Only save if moved > 5 meters OR > 60 seconds passed (heartbeat)
+                if dist > 0.005 || timeSince > 60 {
+                    shouldSave = true
+                    distanceIncrement = dist
+                }
+            } else {
+                // First point in session
+                shouldSave = true
+            }
+            
+            if shouldSave {
+                self.state.withLockedValue { $0.lastSavedPoints[clientId] = (currentLat, currentLon, now) }
+                
+                Task {
+                    do {
+                        // Create point
+                        let point = LocationPoint(
+                            sessionId: sessionId,
+                            latitude: currentLat,
+                            longitude: currentLon,
+                            timestamp: payload.timestamp != nil ? ISO8601DateFormatter().date(from: payload.timestamp!) : nil
+                        )
+                        try await point.save(on: self.db)
+                        
+                        // Update session stats
+                        if let session = try await TrackingSession.find(sessionId, on: self.db) {
+                            session.totalDistanceKm += distanceIncrement
+                            session.endTime = now
+                            try await session.update(on: self.db)
+                        }
+                    } catch {
+                        print("❌ Failed to persist location: \(error)")
+                    }
+                }
+            }
+        }
+
+        return adminEvents
     }
 
-    func remove(connectionId: UUID) -> [(WebSocket, ServerEvent)] {
+    func startTracking(clientId: String, sessionTag: String?) async throws -> UUID {
+        // Ensure client exists in DB
+        if try await Client.find(clientId, on: self.db) == nil {
+            try await Client(id: clientId).create(on: self.db)
+        }
+        
+        // Stop any existing session
+        _ = try await stopTracking(clientId: clientId)
+        
+        // Create new session
+        let session = TrackingSession(clientId: clientId, sessionTag: sessionTag)
+        try await session.create(on: self.db)
+        let sessionId = try session.requireID()
+        
+        // --- NEW: Save initial location immediately if we have it ---
+        let initialLocation = self.state.withLockedValue { state in
+            state.activeSessions[clientId] = sessionId
+            state.lastSavedPoints.removeValue(forKey: clientId)
+            return state.latestLocations[clientId]
+        }
+        
+        if let loc = initialLocation {
+            let point = LocationPoint(
+                sessionId: sessionId,
+                latitude: loc.latitude,
+                longitude: loc.longitude,
+                timestamp: loc.timestamp != nil ? ISO8601DateFormatter().date(from: loc.timestamp!) : nil
+            )
+            try await point.save(on: self.db)
+            self.state.withLockedValue { $0.lastSavedPoints[clientId] = (loc.latitude, loc.longitude, Date()) }
+        }
+        
+        return sessionId
+    }
+
+    func stopTracking(clientId: String) async throws -> UUID? {
+        let sessionData = self.state.withLockedValue { state -> (UUID?, StoredLocation?) in
+            let id = state.activeSessions.removeValue(forKey: clientId)
+            let loc = state.latestLocations[clientId]
+            return (id, loc)
+        }
+        
+        guard let sessionId = sessionData.0 else { return nil }
+        
+        if let session = try await TrackingSession.find(sessionId, on: self.db) {
+            // --- NEW: Save final location as the last breadcrumb ---
+            if let loc = sessionData.1 {
+                let point = LocationPoint(
+                    sessionId: sessionId,
+                    latitude: loc.latitude,
+                    longitude: loc.longitude,
+                    timestamp: loc.timestamp != nil ? ISO8601DateFormatter().date(from: loc.timestamp!) : nil
+                )
+                try await point.save(on: self.db)
+            }
+            
+            session.endTime = Date()
+            try await session.update(on: self.db)
+        }
+        return sessionId
+    }
+
+    func remove(connectionId: UUID) -> (clientId: String?, events: [(WebSocket, ServerEvent)]) {
         self.state.withLockedValue { state in
             var events: [(WebSocket, ServerEvent)] = []
+            var removedClientId: String? = nil
 
             if let clientId = state.clientByConnection.removeValue(forKey: connectionId) {
+                removedClientId = clientId
                 state.clientSockets.removeValue(forKey: connectionId)
                 // When client disconnects, mark as offline but KEEP the location
                 if var location = state.latestLocations[clientId] {
@@ -211,9 +337,21 @@ private final class LiveLocationHub: @unchecked Sendable {
                 }
             }
 
-            return events
+            return (removedClientId, events)
         }
     }
+}
+
+/// Haversine formula to calculate distance between two points in km.
+private func haversineDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double) -> Double {
+    let R = 6371.0 // Earth radius in km
+    let dLat = (lat2 - lat1) * .pi / 180.0
+    let dLon = (lon2 - lon1) * .pi / 180.0
+    let a = sin(dLat/2) * sin(dLat/2) +
+            cos(lat1 * .pi / 180.0) * cos(lat2 * .pi / 180.0) *
+            sin(dLon/2) * sin(dLon/2)
+    let c = 2 * atan2(sqrt(a), sqrt(1-a))
+    return R * c
 }
 
 private let jsonEncoder = JSONEncoder()
@@ -236,7 +374,7 @@ extension DatabaseID {
 }
 
 func routes(_ app: Application) throws {
-    let hub = LiveLocationHub()
+    let hub = LiveLocationHub(db: app.db)
 
     // --- MBTiles Setup ---
     let mbtilesPath = "osm-2020-02-10-v3.11_iran_tehran.mbtiles"
@@ -254,6 +392,28 @@ func routes(_ app: Application) throws {
 
     app.get("health") { _ in
         ["status": "ok"]
+    }
+
+    // --- Diagnostic: Check Tracking History ---
+    app.get("v1", "history") { req async throws -> [TrackingSession] in
+        try await TrackingSession.query(on: req.db)
+            .with(\.$points)
+            .sort(\.$startTime, .descending)
+            .limit(10)
+            .all()
+    }
+
+    // --- Client-Specific History ---
+    app.get("v1", "history", ":clientId") { req async throws -> [TrackingSession] in
+        guard let clientId = req.parameters.get("clientId") else {
+            throw Abort(.badRequest)
+        }
+        return try await TrackingSession.query(on: req.db)
+            .filter(\.$client.$id == clientId)
+            .with(\.$points)
+            .sort(\.$startTime, .descending)
+            .limit(20)
+            .all()
     }
 
     // --- Internal Map Tile Server ---
@@ -367,8 +527,13 @@ func routes(_ app: Application) throws {
         send(ServerEvent(type: "connected", message: "Register as client or admin before sending other messages."), to: socket)
 
         socket.onClose.whenComplete { _ in
-            let events = hub.remove(connectionId: connectionId)
-            events.forEach { send($0.1, to: $0.0) }
+            let result = hub.remove(connectionId: connectionId)
+            result.events.forEach { send($0.1, to: $0.0) }
+            if let clientId = result.clientId {
+                Task {
+                    try? await hub.stopTracking(clientId: clientId)
+                }
+            }
         }
 
         socket.onText { socket, text in
@@ -391,6 +556,17 @@ func routes(_ app: Application) throws {
                     send(ServerEvent(type: "error", message: "This socket already has a different role."), to: socket)
                     return
                 }
+                
+                // --- NEW: Automatically start tracking session on registration ---
+                Task {
+                    do {
+                        let sessionId = try await hub.startTracking(clientId: clientId, sessionTag: incoming.sessionTag)
+                        print("🚀 Automatic tracking started for \(clientId). Session: \(sessionId)")
+                    } catch {
+                        print("❌ Failed to start automatic tracking: \(error)")
+                    }
+                }
+                
                 send(ServerEvent(type: "client.registered", clientId: clientId), to: socket)
                 events.forEach { send($0.1, to: $0.0) }
 
@@ -446,6 +622,37 @@ func routes(_ app: Application) throws {
                 }
                 send(ServerEvent(type: "admin.unsubscribed", clientIds: clientIds), to: socket)
                 notifications.forEach { send($0.1, to: $0.0) }
+
+            case "admin.start_tracking":
+                guard let clientId = incoming.clientId else {
+                    send(ServerEvent(type: "error", message: "clientId is required to start tracking."), to: socket)
+                    return
+                }
+                Task {
+                    do {
+                        let sessionId = try await hub.startTracking(clientId: clientId, sessionTag: incoming.sessionTag)
+                        send(ServerEvent(type: "admin.tracking_started", clientId: clientId, message: "Session ID: \(sessionId)"), to: socket)
+                    } catch {
+                        send(ServerEvent(type: "error", message: "Failed to start tracking: \(error)"), to: socket)
+                    }
+                }
+
+            case "admin.stop_tracking":
+                guard let clientId = incoming.clientId else {
+                    send(ServerEvent(type: "error", message: "clientId is required to stop tracking."), to: socket)
+                    return
+                }
+                Task {
+                    do {
+                        if let sessionId = try await hub.stopTracking(clientId: clientId) {
+                            send(ServerEvent(type: "admin.tracking_stopped", clientId: clientId, message: "Stopped Session: \(sessionId)"), to: socket)
+                        } else {
+                            send(ServerEvent(type: "error", message: "No active session for this client."), to: socket)
+                        }
+                    } catch {
+                        send(ServerEvent(type: "error", message: "Failed to stop tracking: \(error)"), to: socket)
+                    }
+                }
 
             default:
                 send(ServerEvent(type: "error", message: "Unknown message type: \(incoming.type)."), to: socket)
