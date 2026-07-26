@@ -69,13 +69,13 @@ private final class LiveLocationHub: @unchecked Sendable {
         var clientSockets: [UUID: WebSocket] = [:]
         var admins: [UUID: AdminConnection] = [:]
         var latestLocations: [String: StoredLocation] = [:]
-        
+
         /// Maps clientId to an active TrackingSession ID in the database.
         var activeSessions: [String: UUID] = [:]
-        
+
         /// Tracks the last saved point for throttling (to avoid DB jitter).
         var lastSavedPoints: [String: (latitude: Double, longitude: Double, time: Date)] = [:]
-        
+
         /// Tracks last update time for REST clients to detect offline status.
         var lastSeenREST: [String: Date] = [:]
     }
@@ -182,27 +182,27 @@ private final class LiveLocationHub: @unchecked Sendable {
             let adminEvents = state.admins.values
                 .filter { $0.subscriptions.contains(clientId) }
                 .map { ($0.socket, event) }
-            
+
             state.lastSeenREST[clientId] = now
 
             return (state.activeSessions[clientId], state.lastSavedPoints[clientId], adminEvents)
         }
 
         guard let adminEvents = result.2 else { return nil }
-        
+
         // --- Persistence Logic (Senior Approach: Throttling & Incremental Stats) ---
         if let sessionId = result.0 {
             let lastPoint = result.1
             let currentLat = payload.latitude
             let currentLon = payload.longitude
-            
+
             var shouldSave = false
             var distanceIncrement: Double = 0.0
-            
+
             if let last = lastPoint {
                 let dist = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
                 let timeSince = now.timeIntervalSince(last.time)
-                
+
                 // Only save if moved > 5 meters OR > 60 seconds passed (heartbeat)
                 if dist > 0.005 || timeSince > 60 {
                     shouldSave = true
@@ -212,10 +212,10 @@ private final class LiveLocationHub: @unchecked Sendable {
                 // First point in session
                 shouldSave = true
             }
-            
+
             if shouldSave {
                 self.state.withLockedValue { $0.lastSavedPoints[clientId] = (currentLat, currentLon, now) }
-                
+
                 Task {
                     do {
                         // Create point
@@ -226,7 +226,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                             timestamp: payload.timestamp != nil ? ISO8601DateFormatter().date(from: payload.timestamp!) : nil
                         )
                         try await point.save(on: self.db)
-                        
+
                         // Update session stats
                         if let session = try await TrackingSession.find(sessionId, on: self.db) {
                             session.totalDistanceKm += distanceIncrement
@@ -260,7 +260,7 @@ private final class LiveLocationHub: @unchecked Sendable {
             let adminEvents = state.admins.values
                 .filter { $0.subscriptions.contains(clientId) }
                 .map { ($0.socket, event) }
-            
+
             state.lastSeenREST[clientId] = now
 
             return (state.activeSessions[clientId], state.lastSavedPoints[clientId], adminEvents)
@@ -273,14 +273,14 @@ private final class LiveLocationHub: @unchecked Sendable {
         } else {
             sessionId = try await startTracking(clientId: clientId, sessionTag: "REST")
         }
-        
+
         let lastPoint = result.1
         let currentLat = payload.latitude
         let currentLon = payload.longitude
-        
+
         var shouldSave = false
         var distanceIncrement: Double = 0.0
-        
+
         if let last = lastPoint {
             let dist = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
             let timeSince = now.timeIntervalSince(last.time)
@@ -291,7 +291,7 @@ private final class LiveLocationHub: @unchecked Sendable {
         } else {
             shouldSave = true
         }
-        
+
         if shouldSave {
             self.state.withLockedValue { $0.lastSavedPoints[clientId] = (currentLat, currentLon, now) }
             let point = LocationPoint(
@@ -313,18 +313,18 @@ private final class LiveLocationHub: @unchecked Sendable {
     func cleanupRESTSessions() async {
         let now = Date()
         let timeout: TimeInterval = 60
-        
+
         let expiredClientIds = self.state.withLockedValue { state -> [String] in
             state.lastSeenREST.filter { now.timeIntervalSince($0.value) > timeout }.map { $0.key }
         }
-        
+
         for clientId in expiredClientIds {
             print("⏱️ REST Heartbeat timeout for \(clientId). Cleaning up...")
-            
+
             // Mark as offline and notify admins
             let adminEvents = self.state.withLockedValue { state -> [(WebSocket, ServerEvent)] in
                 state.lastSeenREST.removeValue(forKey: clientId)
-                
+
                 guard var location = state.latestLocations[clientId] else { return [] }
                 location = StoredLocation(
                     clientId: clientId,
@@ -335,16 +335,16 @@ private final class LiveLocationHub: @unchecked Sendable {
                     isOnline: false
                 )
                 state.latestLocations[clientId] = location
-                
+
                 let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
                 return state.admins.values
                     .filter { $0.subscriptions.contains(clientId) }
                     .map { ($0.socket, event) }
             }
-            
+
             // Notify admins
             adminEvents.forEach { send($0.1, to: $0.0) }
-            
+
             // Close tracking session in DB
             do {
                 if let sessionId = try await stopTracking(clientId: clientId) {
@@ -358,14 +358,14 @@ private final class LiveLocationHub: @unchecked Sendable {
 
     func stopREST(clientId: String) async throws {
         print("🛑 REST explicit stop for \(clientId)")
-        
+
         // Mark as offline and notify admins
         let adminEvents = self.state.withLockedValue { state -> [(WebSocket, ServerEvent)] in
             state.lastSeenREST.removeValue(forKey: clientId)
-            
-            guard var location = state.latestLocations[clientId] else { 
+
+            guard var location = state.latestLocations[clientId] else {
                 print("⚠️ No latest location for \(clientId) to mark offline.")
-                return [] 
+                return []
             }
             location = StoredLocation(
                 clientId: clientId,
@@ -376,18 +376,18 @@ private final class LiveLocationHub: @unchecked Sendable {
                 isOnline: false
             )
             state.latestLocations[clientId] = location
-            
+
             let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
             let admins = state.admins.values
                 .filter { $0.subscriptions.contains(clientId) }
-            
+
             print("📣 Notifying \(admins.count) admins about \(clientId) going offline.")
             return admins.map { ($0.socket, event) }
         }
-        
+
         // Notify admins
         adminEvents.forEach { send($0.1, to: $0.0) }
-        
+
         // Close tracking session in DB
         _ = try await stopTracking(clientId: clientId)
     }
@@ -397,22 +397,22 @@ private final class LiveLocationHub: @unchecked Sendable {
         if try await Client.find(clientId, on: self.db) == nil {
             try await Client(id: clientId).create(on: self.db)
         }
-        
+
         // Stop any existing session
         _ = try await stopTracking(clientId: clientId)
-        
+
         // Create new session
         let session = TrackingSession(clientId: clientId, sessionTag: sessionTag)
         try await session.create(on: self.db)
         let sessionId = try session.requireID()
-        
+
         // --- NEW: Save initial location immediately if we have it ---
         let initialLocation = self.state.withLockedValue { state in
             state.activeSessions[clientId] = sessionId
             state.lastSavedPoints.removeValue(forKey: clientId)
             return state.latestLocations[clientId]
         }
-        
+
         if let loc = initialLocation {
             let point = LocationPoint(
                 sessionId: sessionId,
@@ -423,7 +423,7 @@ private final class LiveLocationHub: @unchecked Sendable {
             try await point.save(on: self.db)
             self.state.withLockedValue { $0.lastSavedPoints[clientId] = (loc.latitude, loc.longitude, Date()) }
         }
-        
+
         return sessionId
     }
 
@@ -433,9 +433,9 @@ private final class LiveLocationHub: @unchecked Sendable {
             let loc = state.latestLocations[clientId]
             return (id, loc)
         }
-        
+
         guard let sessionId = sessionData.0 else { return nil }
-        
+
         if let session = try await TrackingSession.find(sessionId, on: self.db) {
             // --- NEW: Save final location as the last breadcrumb ---
             if let loc = sessionData.1 {
@@ -447,7 +447,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                 )
                 try await point.save(on: self.db)
             }
-            
+
             session.endTime = Date()
             try await session.update(on: self.db)
         }
@@ -539,6 +539,7 @@ func routes(_ app: Application) throws {
     }
 
     // --- MBTiles Setup ---
+    // "/maps/osm-2020-02-10-v3.11_iran_tehran.mbtiles"
     let mbtilesPath = "osm-2020-02-10-v3.11_iran_tehran.mbtiles"
     let fileManager = FileManager.default
     if fileManager.fileExists(atPath: mbtilesPath) {
@@ -563,10 +564,10 @@ func routes(_ app: Application) throws {
         }
         let payload = try req.content.decode(LocationPayload.self)
         let adminEvents = try await hub.publishREST(clientId: clientId, payload: payload)
-        
+
         // Notify admins
         adminEvents.forEach { send($0.1, to: $0.0) }
-        
+
         return "ok"
     }
 
@@ -636,7 +637,7 @@ func routes(_ app: Application) throws {
     // Simple Mapbox Style for Internal Vector Tiles
     app.get("v1", "map", "style.json") { req -> Response in
         let host = req.headers.first(name: .host) ?? "localhost:8080"
-        
+
         // Detect scheme robustly, especially when behind a proxy like Nginx or Cloudflare
         var scheme = "http"
         if let forwardedProto = req.headers.first(name: "X-Forwarded-Proto") {
@@ -740,7 +741,7 @@ func routes(_ app: Application) throws {
                     send(ServerEvent(type: "error", message: "This socket already has a different role."), to: socket)
                     return
                 }
-                
+
                 // --- NEW: Automatically start tracking session on registration ---
                 Task {
                     do {
@@ -750,7 +751,7 @@ func routes(_ app: Application) throws {
                         print("❌ Failed to start automatic tracking: \(error)")
                     }
                 }
-                
+
                 send(ServerEvent(type: "client.registered", clientId: clientId), to: socket)
                 events.forEach { send($0.1, to: $0.0) }
 

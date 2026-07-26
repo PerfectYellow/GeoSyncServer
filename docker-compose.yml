@@ -15,15 +15,24 @@
 
 x-shared_environment: &shared_environment
   LOG_LEVEL: ${LOG_LEVEL:-debug}
-  
+
 services:
   app:
     image: geosyncbackend:latest
+    container_name: geosync-server
     build:
       context: .
+    networks:
+      - default
+      - caddy_net
     environment:
       <<: *shared_environment
-    ports:
-      - '8080:8080'
+    volumes:
+      - /home/afshar/maps:/maps:ro
     # user: '0' # uncomment to run as root for testing purposes even though Dockerfile defines 'vapor' user.
     command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
+
+networks:
+  caddy_net:
+    external: true
+    name: n8n_default
