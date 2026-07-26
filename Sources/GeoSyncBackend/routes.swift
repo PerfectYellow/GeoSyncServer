@@ -75,6 +75,9 @@ private final class LiveLocationHub: @unchecked Sendable {
         
         /// Tracks the last saved point for throttling (to avoid DB jitter).
         var lastSavedPoints: [String: (latitude: Double, longitude: Double, time: Date)] = [:]
+        
+        /// Tracks last update time for REST clients to detect offline status.
+        var lastSeenREST: [String: Date] = [:]
     }
 
     private let state = NIOLockedValueBox(State())
@@ -180,6 +183,8 @@ private final class LiveLocationHub: @unchecked Sendable {
                 .filter { $0.subscriptions.contains(clientId) }
                 .map { ($0.socket, event) }
             
+            state.lastSeenREST[clientId] = now
+
             return (state.activeSessions[clientId], state.lastSavedPoints[clientId], adminEvents)
         }
 
@@ -236,6 +241,155 @@ private final class LiveLocationHub: @unchecked Sendable {
         }
 
         return adminEvents
+    }
+
+    func publishREST(clientId: String, payload: LocationPayload) async throws -> [(WebSocket, ServerEvent)] {
+        let now = Date()
+        let result = self.state.withLockedValue { state -> (UUID?, (latitude: Double, longitude: Double, time: Date)?, [(WebSocket, ServerEvent)]) in
+            let location = StoredLocation(
+                clientId: clientId,
+                latitude: payload.latitude,
+                longitude: payload.longitude,
+                timestamp: payload.timestamp,
+                receivedAt: ISO8601DateFormatter().string(from: now),
+                isOnline: true
+            )
+            state.latestLocations[clientId] = location
+            let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
+
+            let adminEvents = state.admins.values
+                .filter { $0.subscriptions.contains(clientId) }
+                .map { ($0.socket, event) }
+            
+            state.lastSeenREST[clientId] = now
+
+            return (state.activeSessions[clientId], state.lastSavedPoints[clientId], adminEvents)
+        }
+
+        let adminEvents = result.2
+        let sessionId: UUID
+        if let existingId = result.0 {
+            sessionId = existingId
+        } else {
+            sessionId = try await startTracking(clientId: clientId, sessionTag: "REST")
+        }
+        
+        let lastPoint = result.1
+        let currentLat = payload.latitude
+        let currentLon = payload.longitude
+        
+        var shouldSave = false
+        var distanceIncrement: Double = 0.0
+        
+        if let last = lastPoint {
+            let dist = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
+            let timeSince = now.timeIntervalSince(last.time)
+            if dist > 0.005 || timeSince > 60 {
+                shouldSave = true
+                distanceIncrement = dist
+            }
+        } else {
+            shouldSave = true
+        }
+        
+        if shouldSave {
+            self.state.withLockedValue { $0.lastSavedPoints[clientId] = (currentLat, currentLon, now) }
+            let point = LocationPoint(
+                sessionId: sessionId,
+                latitude: currentLat,
+                longitude: currentLon,
+                timestamp: payload.timestamp != nil ? ISO8601DateFormatter().date(from: payload.timestamp!) : nil
+            )
+            try await point.save(on: self.db)
+            if let session = try await TrackingSession.find(sessionId, on: self.db) {
+                session.totalDistanceKm += distanceIncrement
+                session.endTime = now
+                try await session.update(on: self.db)
+            }
+        }
+        return adminEvents
+    }
+
+    func cleanupRESTSessions() async {
+        let now = Date()
+        let timeout: TimeInterval = 60
+        
+        let expiredClientIds = self.state.withLockedValue { state -> [String] in
+            state.lastSeenREST.filter { now.timeIntervalSince($0.value) > timeout }.map { $0.key }
+        }
+        
+        for clientId in expiredClientIds {
+            print("⏱️ REST Heartbeat timeout for \(clientId). Cleaning up...")
+            
+            // Mark as offline and notify admins
+            let adminEvents = self.state.withLockedValue { state -> [(WebSocket, ServerEvent)] in
+                state.lastSeenREST.removeValue(forKey: clientId)
+                
+                guard var location = state.latestLocations[clientId] else { return [] }
+                location = StoredLocation(
+                    clientId: clientId,
+                    latitude: location.latitude,
+                    longitude: location.longitude,
+                    timestamp: location.timestamp,
+                    receivedAt: location.receivedAt,
+                    isOnline: false
+                )
+                state.latestLocations[clientId] = location
+                
+                let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
+                return state.admins.values
+                    .filter { $0.subscriptions.contains(clientId) }
+                    .map { ($0.socket, event) }
+            }
+            
+            // Notify admins
+            adminEvents.forEach { send($0.1, to: $0.0) }
+            
+            // Close tracking session in DB
+            do {
+                if let sessionId = try await stopTracking(clientId: clientId) {
+                    print("✅ Closed REST session \(sessionId) for \(clientId)")
+                }
+            } catch {
+                print("❌ Failed to close REST session for \(clientId): \(error)")
+            }
+        }
+    }
+
+    func stopREST(clientId: String) async throws {
+        print("🛑 REST explicit stop for \(clientId)")
+        
+        // Mark as offline and notify admins
+        let adminEvents = self.state.withLockedValue { state -> [(WebSocket, ServerEvent)] in
+            state.lastSeenREST.removeValue(forKey: clientId)
+            
+            guard var location = state.latestLocations[clientId] else { 
+                print("⚠️ No latest location for \(clientId) to mark offline.")
+                return [] 
+            }
+            location = StoredLocation(
+                clientId: clientId,
+                latitude: location.latitude,
+                longitude: location.longitude,
+                timestamp: location.timestamp,
+                receivedAt: location.receivedAt,
+                isOnline: false
+            )
+            state.latestLocations[clientId] = location
+            
+            let event = ServerEvent(type: "location.update", clientId: clientId, location: location)
+            let admins = state.admins.values
+                .filter { $0.subscriptions.contains(clientId) }
+            
+            print("📣 Notifying \(admins.count) admins about \(clientId) going offline.")
+            return admins.map { ($0.socket, event) }
+        }
+        
+        // Notify admins
+        adminEvents.forEach { send($0.1, to: $0.0) }
+        
+        // Close tracking session in DB
+        _ = try await stopTracking(clientId: clientId)
     }
 
     func startTracking(clientId: String, sessionTag: String?) async throws -> UUID {
@@ -376,6 +530,14 @@ extension DatabaseID {
 func routes(_ app: Application) throws {
     let hub = LiveLocationHub(db: app.db)
 
+    // --- Background Cleanup Loop for REST Sessions ---
+    Task {
+        while true {
+            try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+            await hub.cleanupRESTSessions()
+        }
+    }
+
     // --- MBTiles Setup ---
     let mbtilesPath = "osm-2020-02-10-v3.11_iran_tehran.mbtiles"
     let fileManager = FileManager.default
@@ -392,6 +554,28 @@ func routes(_ app: Application) throws {
 
     app.get("health") { _ in
         ["status": "ok"]
+    }
+
+    // --- REST Location Update ---
+    app.post("v1", "location", ":clientId") { req async throws -> String in
+        guard let clientId = req.parameters.get("clientId") else {
+            throw Abort(.badRequest)
+        }
+        let payload = try req.content.decode(LocationPayload.self)
+        let adminEvents = try await hub.publishREST(clientId: clientId, payload: payload)
+        
+        // Notify admins
+        adminEvents.forEach { send($0.1, to: $0.0) }
+        
+        return "ok"
+    }
+
+    app.post("v1", "location", ":clientId", "stop") { req async throws -> String in
+        guard let clientId = req.parameters.get("clientId") else {
+            throw Abort(.badRequest)
+        }
+        try await hub.stopREST(clientId: clientId)
+        return "ok"
     }
 
     // --- Diagnostic: Check Tracking History ---
