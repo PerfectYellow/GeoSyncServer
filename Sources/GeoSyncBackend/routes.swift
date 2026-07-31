@@ -540,7 +540,7 @@ func routes(_ app: Application) throws {
 
     // --- MBTiles Setup ---
     // "/maps/osm-2020-02-10-v3.11_iran_tehran.mbtiles"
-    let mbtilesPath = "osm-2020-02-10-v3.11_iran_tehran.mbtiles"
+    let mbtilesPath = "/maps/osm-2020-02-10-v3.11_iran_tehran.mbtiles"
     let fileManager = FileManager.default
     if fileManager.fileExists(atPath: mbtilesPath) {
         print("✅ MBTiles file found at: \(mbtilesPath)")
@@ -646,48 +646,42 @@ func routes(_ app: Application) throws {
             scheme = "https"
         }
 
+        // Updated style.json with labels and icons support
         let style = """
-                    {
-                      "version": 8,
-                      "name": "GeoSync Internal",
-                      "sources": {
-                        "internal": {
-                          "type": "vector",
-                          "tiles": ["\(scheme)://\(host)/v1/map/tiles/{z}/{x}/{y}"],
-                          "minzoom": 0,
-                          "maxzoom": 22
-                        }
-                      },
-                      "layers": [
-                        {
-                          "id": "background",
-                          "type": "background",
-                          "paint": { "background-color": "#f8f4f0" }
-                        },
-                        {
-                          "id": "water",
-                          "source": "internal",
-                          "source-layer": "water",
-                          "type": "fill",
-                          "paint": { "fill-color": "#a0cfdf" }
-                        },
-                        {
-                          "id": "roads",
-                          "source": "internal",
-                          "source-layer": "transportation",
-                          "type": "line",
-                          "paint": { "line-color": "#ffffff", "line-width": 2 }
-                        },
-                        {
-                          "id": "buildings",
-                          "source": "internal",
-                          "source-layer": "building",
-                          "type": "fill",
-                          "paint": { "fill-color": "#dcdcdc" }
-                        }
-                      ]
-                    }
-                    """
+        {
+          "version": 8,
+          "name": "GeoSync Internal",
+          "glyphs": "\(scheme)://\(host)/fonts/{fontstack}/{range}.pbf",
+          "sprite": "\(scheme)://\(host)/sprites/sprite",
+          "sources": {
+            "internal": {
+              "type": "vector",
+              "tiles": ["\(scheme)://\(host)/v1/map/tiles/{z}/{x}/{y}"],
+              "minzoom": 0,
+              "maxzoom": 22
+            }
+          },
+          "layers": [
+            { "id": "background", "type": "background", "paint": { "background-color": "#f8f4f0" } },
+            { "id": "water", "source": "internal", "source-layer": "water", "type": "fill", "paint": { "fill-color": "#a0cfdf" } },
+            { "id": "roads", "source": "internal", "source-layer": "transportation", "type": "line", "paint": { "line-color": "#ffffff", "line-width": 2 } },
+            { "id": "buildings", "source": "internal", "source-layer": "building", "type": "fill", "paint": { "fill-color": "#dcdcdc" } },
+            // ADDED: Symbol layer for city/place labels
+            {
+              "id": "place-labels",
+              "source": "internal",
+              "source-layer": "place",
+              "type": "symbol",
+              "layout": {
+                "text-field": "{name}",
+                "text-font": ["Open Sans Regular"],
+                "text-size": 12
+              },
+              "paint": { "text-color": "#333333" }
+            }
+          ]
+        }
+        """
         var headers = HTTPHeaders()
         headers.add(name: .contentType, value: "application/json")
         return Response(status: .ok, headers: headers, body: .init(string: style))
