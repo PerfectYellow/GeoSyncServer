@@ -540,7 +540,7 @@ func routes(_ app: Application) throws {
 
     // --- MBTiles Setup ---
     // "/maps/osm-2020-02-10-v3.11_iran_tehran.mbtiles"
-    let mbtilesPath = "/maps/osm-2020-02-10-v3.11_iran_tehran.mbtiles"
+    let mbtilesPath = "osm-2020-02-10-v3.11_iran_tehran.mbtiles"
     let fileManager = FileManager.default
     if fileManager.fileExists(atPath: mbtilesPath) {
         print("✅ MBTiles file found at: \(mbtilesPath)")
@@ -646,7 +646,9 @@ func routes(_ app: Application) throws {
             scheme = "https"
         }
 
-        // Updated style.json with labels and icons support
+        // Updated style.json with labels and icons support.
+        // NOTE: real JSON has no comments — keep any notes outside the string literal,
+        // a stray "//" inside this triple-quoted string breaks parsing on the client.
         let style = """
         {
           "version": 8,
@@ -666,18 +668,41 @@ func routes(_ app: Application) throws {
             { "id": "water", "source": "internal", "source-layer": "water", "type": "fill", "paint": { "fill-color": "#a0cfdf" } },
             { "id": "roads", "source": "internal", "source-layer": "transportation", "type": "line", "paint": { "line-color": "#ffffff", "line-width": 2 } },
             { "id": "buildings", "source": "internal", "source-layer": "building", "type": "fill", "paint": { "fill-color": "#dcdcdc" } },
-            // ADDED: Symbol layer for city/place labels
             {
               "id": "place-labels",
               "source": "internal",
               "source-layer": "place",
               "type": "symbol",
               "layout": {
-                "text-field": "{name}",
+                "text-field": ["get", "name"],
                 "text-font": ["Open Sans Regular"],
-                "text-size": 12
+                "text-size": ["interpolate", ["linear"], ["zoom"], 4, 10, 12, 16]
               },
-              "paint": { "text-color": "#333333" }
+              "paint": {
+                "text-color": "#333333",
+                "text-halo-color": "#ffffff",
+                "text-halo-width": 1.2
+              }
+            },
+            {
+              "id": "poi-icons",
+              "source": "internal",
+              "source-layer": "poi",
+              "type": "symbol",
+              "layout": {
+                "icon-image": ["get", "class"],
+                "icon-size": 0.8,
+                "text-field": ["get", "name"],
+                "text-font": ["Open Sans Regular"],
+                "text-size": 11,
+                "text-offset": [0, 1.2],
+                "text-anchor": "top"
+              },
+              "paint": {
+                "text-color": "#333333",
+                "text-halo-color": "#ffffff",
+                "text-halo-width": 1.0
+              }
             }
           ]
         }
@@ -685,6 +710,51 @@ func routes(_ app: Application) throws {
         var headers = HTTPHeaders()
         headers.add(name: .contentType, value: "application/json")
         return Response(status: .ok, headers: headers, body: .init(string: style))
+    }
+
+    // --- Glyphs (required for any text-field / symbol layer to render) ---
+    // Real files live at /fonts/_output/<fontstack>/<range> inside the container
+    // (confirmed via `docker exec geosync-server ls /fonts/_output`), built by
+    // running `npm install && node generate.js` in the openmaptiles/fonts clone.
+    // Route path is root-level "fonts/..." to match the glyphs URL in style.json above.
+    app.get("fonts", ":fontstack", ":range") { req async throws -> Response in
+        guard let fontstack = req.parameters.get("fontstack"),
+              let range = req.parameters.get("range") else {
+            return Response(status: .badRequest)
+        }
+        let path = "/fonts/_output/\(fontstack)/\(range)"
+        guard FileManager.default.fileExists(atPath: path) else {
+            return Response(status: .notFound)
+        }
+        return try await req.fileio.asyncStreamFile(
+            at: path,
+            mediaType: .init(type: "application", subType: "x-protobuf")
+        )
+    }
+
+    // --- Sprite (required for any icon-image to render) ---
+    // Real files live at /sprites/sprite.json, /sprites/sprite.png, /sprites/sprite@2x.json,
+    // /sprites/sprite@2x.png inside the container (confirmed via `docker exec ... ls /sprites`).
+    // MapLibre appends these suffixes directly onto the "sprite" URL from style.json above —
+    // it does NOT request a sub-path, so each filename needs its own literal route.
+    @Sendable func serveSpriteFile(_ req: Request, filename: String, mediaType: HTTPMediaType) async throws -> Response {
+        let path = "/sprites/\(filename)"
+        guard FileManager.default.fileExists(atPath: path) else {
+            return Response(status: .notFound)
+        }
+        return try await req.fileio.asyncStreamFile(at: path, mediaType: mediaType)
+    }
+    app.get("sprites", "sprite.json") { req in
+        try await serveSpriteFile(req, filename: "sprite.json", mediaType: .json)
+    }
+    app.get("sprites", "sprite.png") { req in
+        try await serveSpriteFile(req, filename: "sprite.png", mediaType: .png)
+    }
+    app.get("sprites", "sprite@2x.json") { req in
+        try await serveSpriteFile(req, filename: "sprite@2x.json", mediaType: .json)
+    }
+    app.get("sprites", "sprite@2x.png") { req in
+        try await serveSpriteFile(req, filename: "sprite@2x.png", mediaType: .png)
     }
 
     // Diagnostic route to check map metadata
