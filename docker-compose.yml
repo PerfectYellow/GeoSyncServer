@@ -29,6 +29,8 @@ services:
       <<: *shared_environment
     volumes:
       - /home/afshar/maps:/maps:ro
+      - /home/afshar/fonts:/fonts:ro
+      - /home/afshar/sprites:/sprites:ro
     # user: '0' # uncomment to run as root for testing purposes even though Dockerfile defines 'vapor' user.
     command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
 
