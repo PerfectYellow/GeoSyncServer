@@ -660,7 +660,7 @@ func routes(_ app: Application) throws {
               "type": "vector",
               "tiles": ["\(scheme)://\(host)/v1/map/tiles/{z}/{x}/{y}"],
               "minzoom": 0,
-              "maxzoom": 22
+              "maxzoom": 14
             }
           },
           "layers": [
