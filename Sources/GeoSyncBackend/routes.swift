@@ -9,6 +9,8 @@ struct LocationPayload: Content {
     let longitude: Double
     /// An optional ISO-8601 timestamp supplied by the device.
     let timestamp: String?
+    /// If true, bypasses throttling and saves the point immediately.
+    var isManual: Bool? = false
 }
 
 /// One WebSocket message shape used by both mobile roles.
@@ -21,6 +23,7 @@ struct LiveLocationMessage: Content {
     let timestamp: String?
     let message: String?
     let sessionTag: String?
+    let isManual: Bool?
 }
 
 private struct StoredLocation: Content {
@@ -55,6 +58,31 @@ private struct ServerEvent: Content {
         self.message = message
         self.subscribersCount = subscribersCount
     }
+}
+
+// MARK: - History query parameters
+
+/// Query string shape for GET /v1/history and /v1/history/:clientId
+/// Example: /v1/history/abc123?from=2025-01-01T00:00:00Z&to=2025-01-02T00:00:00Z&page=1&per=50
+private struct HistoryQuery: Content {
+    /// ISO-8601 start of the requested window (inclusive). If nil, no lower bound.
+    let from: String?
+    /// ISO-8601 end of the requested window (inclusive). If nil, no upper bound.
+    let to: String?
+    /// Page number, 1-indexed. Defaults to 1.
+    let page: Int?
+    /// Items per page. Defaults to 50, capped at 200 to keep payloads sane.
+    let per: Int?
+}
+
+/// A page of tracking sessions with metadata about total count / pages remaining,
+/// so the client's lazy-loading UI knows when to stop asking.
+private struct HistoryPage: Content {
+    let sessions: [TrackingSession]
+    let page: Int
+    let per: Int
+    let total: Int
+    let hasMore: Bool
 }
 
 /// Thread-safe, process-local relay state.
@@ -199,7 +227,12 @@ private final class LiveLocationHub: @unchecked Sendable {
             var shouldSave = false
             var distanceIncrement: Double = 0.0
 
-            if let last = lastPoint {
+            if payload.isManual == true {
+                shouldSave = true
+                if let last = lastPoint {
+                    distanceIncrement = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
+                }
+            } else if let last = lastPoint {
                 let dist = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
                 let timeSince = now.timeIntervalSince(last.time)
 
@@ -223,7 +256,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                             sessionId: sessionId,
                             latitude: currentLat,
                             longitude: currentLon,
-                            timestamp: payload.timestamp != nil ? ISO8601DateFormatter().date(from: payload.timestamp!) : nil
+                            timestamp: payload.timestamp?.iso8601Date
                         )
                         try await point.save(on: self.db)
 
@@ -281,7 +314,12 @@ private final class LiveLocationHub: @unchecked Sendable {
         var shouldSave = false
         var distanceIncrement: Double = 0.0
 
-        if let last = lastPoint {
+        if payload.isManual == true {
+            shouldSave = true
+            if let last = lastPoint {
+                distanceIncrement = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
+            }
+        } else if let last = lastPoint {
             let dist = haversineDistance(lat1: last.latitude, lon1: last.longitude, lat2: currentLat, lon2: currentLon)
             let timeSince = now.timeIntervalSince(last.time)
             if dist > 0.005 || timeSince > 60 {
@@ -298,7 +336,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                 sessionId: sessionId,
                 latitude: currentLat,
                 longitude: currentLon,
-                timestamp: payload.timestamp != nil ? ISO8601DateFormatter().date(from: payload.timestamp!) : nil
+                timestamp: payload.timestamp?.iso8601Date
             )
             try await point.save(on: self.db)
             if let session = try await TrackingSession.find(sessionId, on: self.db) {
@@ -418,7 +456,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                 sessionId: sessionId,
                 latitude: loc.latitude,
                 longitude: loc.longitude,
-                timestamp: loc.timestamp != nil ? ISO8601DateFormatter().date(from: loc.timestamp!) : nil
+                timestamp: loc.timestamp?.iso8601Date
             )
             try await point.save(on: self.db)
             self.state.withLockedValue { $0.lastSavedPoints[clientId] = (loc.latitude, loc.longitude, Date()) }
@@ -443,7 +481,7 @@ private final class LiveLocationHub: @unchecked Sendable {
                     sessionId: sessionId,
                     latitude: loc.latitude,
                     longitude: loc.longitude,
-                    timestamp: loc.timestamp != nil ? ISO8601DateFormatter().date(from: loc.timestamp!) : nil
+                    timestamp: loc.timestamp?.iso8601Date
                 )
                 try await point.save(on: self.db)
             }
@@ -508,12 +546,27 @@ private func haversineDistance(lat1: Double, lon1: Double, lat2: Double, lon2: D
     return R * c
 }
 
-private let jsonEncoder = JSONEncoder()
-private let jsonDecoder = JSONDecoder()
+// MARK: - Date Formatting Helpers
+
+extension String {
+    var iso8601Date: Date? {
+        let formatter = ISO8601DateFormatter()
+        // Try with fractional seconds first (e.g. .567Z)
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: self) {
+            return date
+        }
+        // Fallback to standard ISO8601
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: self)
+    }
+}
 
 private func send(_ event: ServerEvent, to socket: WebSocket) {
     do {
-        let data = try jsonEncoder.encode(event)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(event)
         guard let text = String(data: data, encoding: .utf8) else {
             throw Abort(.internalServerError)
         }
@@ -525,6 +578,47 @@ private func send(_ event: ServerEvent, to socket: WebSocket) {
 
 extension DatabaseID {
     static let mbtiles = DatabaseID(string: "mbtiles")
+}
+
+private func fetchHistory(req: Request, clientId: String?) async throws -> HistoryPage {
+    let query = try req.query.decode(HistoryQuery.self)
+
+    var sessionQuery = TrackingSession.query(on: req.db)
+
+    if let clientId {
+        sessionQuery = sessionQuery.filter(\.$client.$id == clientId)
+    }
+
+    // A session is "in range" if it overlaps [from, to] at all:
+    // session.startTime <= to  AND  (session.endTime >= from OR session.endTime is nil, i.e. still active)
+    if let fromStr = query.from, let fromDate = fromStr.iso8601Date {
+        sessionQuery = sessionQuery.group(.or) { group in
+            group.filter(\.$endTime >= fromDate)
+            group.filter(\.$endTime == nil)
+        }
+    }
+    if let toStr = query.to, let toDate = toStr.iso8601Date {
+        sessionQuery = sessionQuery.filter(\.$startTime <= toDate)
+    }
+
+    let page = query.page ?? 1
+    let per = min(query.per ?? 50, 200)
+
+    let total = try await sessionQuery.count()
+
+    let sessions = try await sessionQuery
+        .with(\.$points)
+        .sort(\.$startTime, .descending)
+        .range((page - 1) * per ..< page * per)
+        .all()
+
+    return HistoryPage(
+        sessions: sessions,
+        page: page,
+        per: per,
+        total: total,
+        hasMore: page * per < total
+    )
 }
 
 func routes(_ app: Application) throws {
@@ -557,6 +651,45 @@ func routes(_ app: Application) throws {
         ["status": "ok"]
     }
 
+    // --- History: paginated, optionally time-bounded, across all clients ---
+    app.get("v1", "history") { req async throws -> HistoryPage in
+        try await fetchHistory(req: req, clientId: nil)
+    }
+    
+    // --- History: paginated, optionally time-bounded, for one client ---
+    app.get("v1", "history", ":clientId") { req async throws -> HistoryPage in
+        guard let clientId = req.parameters.get("clientId") else {
+            throw Abort(.badRequest)
+        }
+        return try await fetchHistory(req: req, clientId: clientId)
+    }
+    
+    // --- Points only, for a session, restricted to a time window ---
+    // Useful once you already know the sessionId (e.g. from the history list above)
+    // and just want the breadcrumb trail for a sub-range of that session.
+    app.get("v1", "history", "session", ":sessionId", "points") { req async throws -> Page<LocationPoint> in
+        guard let sessionId = req.parameters.get("sessionId", as: UUID.self) else {
+            throw Abort(.badRequest)
+        }
+        let query = try req.query.decode(HistoryQuery.self)
+    
+        var pointsQuery = LocationPoint.query(on: req.db)
+            .filter(\.$session.$id == sessionId)
+    
+        if let fromStr = query.from, let fromDate = fromStr.iso8601Date {
+            pointsQuery = pointsQuery.filter(\.$timestamp >= fromDate)
+        }
+        if let toStr = query.to, let toDate = toStr.iso8601Date {
+            pointsQuery = pointsQuery.filter(\.$timestamp <= toDate)
+        }
+    
+        let page = query.page ?? 1
+        let per = min(query.per ?? 50, 200)
+        return try await pointsQuery
+            .sort(\.$timestamp, .ascending)
+            .paginate(PageRequest(page: page, per: per))
+    }
+
     // --- REST Location Update ---
     app.post("v1", "location", ":clientId") { req async throws -> String in
         guard let clientId = req.parameters.get("clientId") else {
@@ -579,27 +712,54 @@ func routes(_ app: Application) throws {
         return "ok"
     }
 
-    // --- Diagnostic: Check Tracking History ---
-    app.get("v1", "history") { req async throws -> [TrackingSession] in
-        try await TrackingSession.query(on: req.db)
-            .with(\.$points)
-            .sort(\.$startTime, .descending)
-            .limit(10)
-            .all()
-    }
+    // // --- Diagnostic: Check Tracking History ---
+    // app.get("v1", "history") { req async throws -> [TrackingSession] in
+    //     try await TrackingSession.query(on: req.db)
+    //         .with(\.$points)
+    //         .sort(\.$startTime, .descending)
+    //         .limit(10)
+    //         .all()
+    // }
 
-    // --- Client-Specific History ---
-    app.get("v1", "history", ":clientId") { req async throws -> [TrackingSession] in
-        guard let clientId = req.parameters.get("clientId") else {
-            throw Abort(.badRequest)
-        }
-        return try await TrackingSession.query(on: req.db)
-            .filter(\.$client.$id == clientId)
-            .with(\.$points)
-            .sort(\.$startTime, .descending)
-            .limit(20)
-            .all()
-    }
+    // // --- Client-Specific History ---
+    // app.get("v1", "history", ":clientId") { req async throws -> [TrackingSession] in
+    //     guard let clientId = req.parameters.get("clientId") else {
+    //         throw Abort(.badRequest)
+    //     }
+    //     return try await TrackingSession.query(on: req.db)
+    //         .filter(\.$client.$id == clientId)
+    //         .with(\.$points)
+    //         .sort(\.$startTime, .descending)
+    //         .limit(20)
+    //         .all()
+    // }
+    // 
+    // // // --- All location points for a client across all sessions, in a time window ---
+    // // GET /v1/history/:clientId/points?from=...&to=...&page=1&per=20
+    // app.get("v1", "history", ":clientId", "points") { req async throws -> Page<LocationPoint> in
+    //     guard let clientId = req.parameters.get("clientId") else {
+    //         throw Abort(.badRequest)
+    //     }
+    //     let query = try req.query.decode(HistoryQuery.self)
+    //     let iso = ISO8601DateFormatter()
+    
+    //     var pointsQuery = LocationPoint.query(on: req.db)
+    //         .join(TrackingSession.self, on: \LocationPoint.$session.$id == \TrackingSession.$id)
+    //         .filter(TrackingSession.self, \.$client.$id == clientId)
+    
+    //     if let fromStr = query.from, let fromDate = iso.date(from: fromStr) {
+    //         pointsQuery = pointsQuery.filter(\.$timestamp >= fromDate)
+    //     }
+    //     if let toStr = query.to, let toDate = iso.date(from: toStr) {
+    //         pointsQuery = pointsQuery.filter(\.$timestamp <= toDate)
+    //     }
+    
+    //     let page = query.page ?? 1
+    //     let per = min(query.per ?? 20, 200)
+    //     return try await pointsQuery
+    //         .sort(\.$timestamp, .ascending)
+    //         .paginate(PageRequest(page: page, per: per))
+    // }
 
     // --- Internal Map Tile Server ---
     app.get("v1", "map", "tiles", ":z", ":x", ":y") { req -> EventLoopFuture<Response> in
@@ -788,7 +948,9 @@ func routes(_ app: Application) throws {
         socket.onText { socket, text in
             let incoming: LiveLocationMessage
             do {
-                incoming = try jsonDecoder.decode(LiveLocationMessage.self, from: Data(text.utf8))
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                incoming = try decoder.decode(LiveLocationMessage.self, from: Data(text.utf8))
             } catch {
                 send(ServerEvent(type: "error", message: "Invalid JSON message."), to: socket)
                 return
@@ -830,7 +992,7 @@ func routes(_ app: Application) throws {
                     return
                 }
 
-                let payload = LocationPayload(latitude: latitude, longitude: longitude, timestamp: incoming.timestamp)
+                let payload = LocationPayload(latitude: latitude, longitude: longitude, timestamp: incoming.timestamp, isManual: incoming.isManual)
                 guard let events = hub.publish(connectionId: connectionId, clientId: clientId, payload: payload) else {
                     send(ServerEvent(type: "error", message: "Register this clientId on this socket before publishing."), to: socket)
                     return

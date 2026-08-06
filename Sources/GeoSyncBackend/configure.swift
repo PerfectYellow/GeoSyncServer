@@ -15,6 +15,14 @@ func configure(_ app: Application) async throws {
     // Run migrations automatically
     try await app.autoMigrate()
 
+    // --- Configure JSON Date Encoding Strategy ---
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    ContentConfiguration.global.use(encoder: encoder, for: .json)
+    ContentConfiguration.global.use(decoder: decoder, for: .json)
+
     // register routes
     try routes(app)
 }
