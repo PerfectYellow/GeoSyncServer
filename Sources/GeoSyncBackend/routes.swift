@@ -663,6 +663,29 @@ func routes(_ app: Application) throws {
         }
         return try await fetchHistory(req: req, clientId: clientId)
     }
+
+    // --- History: Available dates for a client ---
+    app.get("v1", "history", ":clientId", "dates") { req async throws -> [String] in
+        guard let clientId = req.parameters.get("clientId") else {
+            throw Abort(.badRequest)
+        }
+        
+        let sessions = try await TrackingSession.query(on: req.db)
+            .filter(\.$client.$id == clientId)
+            .field(\.$startTime)
+            .all()
+            
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0) // Treat as UTC for grouping
+        
+        let dates = Set(sessions.compactMap { session -> String? in
+            guard let date = session.startTime else { return nil }
+            return formatter.string(from: date)
+        })
+        
+        return Array(dates).sorted(by: >)
+    }
     
     // --- Points only, for a session, restricted to a time window ---
     // Useful once you already know the sessionId (e.g. from the history list above)
