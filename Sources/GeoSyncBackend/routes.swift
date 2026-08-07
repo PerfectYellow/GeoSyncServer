@@ -104,8 +104,16 @@ private final class LiveLocationHub: @unchecked Sendable {
         /// Tracks the last saved point for throttling (to avoid DB jitter).
         var lastSavedPoints: [String: (latitude: Double, longitude: Double, time: Date)] = [:]
 
-        /// Tracks last update time for REST clients to detect offline status.
-        var lastSeenREST: [String: Date] = [:]
+        /// Tracks last activity for all clients.
+        var lastActivity: [String: Date] = [:]
+
+        /// Tracks if the last activity was via WebSocket or REST.
+        var lastTransport: [String: TransportType] = [:]
+    }
+
+    enum TransportType {
+        case websocket
+        case rest
     }
 
     private let state = NIOLockedValueBox(State())
@@ -116,11 +124,11 @@ private final class LiveLocationHub: @unchecked Sendable {
     }
 
     func registerClient(connectionId: UUID, clientId: String, socket: WebSocket) -> (Bool, [(WebSocket, ServerEvent)]) {
-        // ... (existing logic)
         self.state.withLockedValue { state in
             guard state.admins[connectionId] == nil, state.clientByConnection[connectionId] == nil else { return (false, []) }
             state.clientByConnection[connectionId] = clientId
             state.clientSockets[connectionId] = socket
+            state.lastActivity[clientId] = Date()
 
             let subscribersCount = state.admins.values.filter { $0.subscriptions.contains(clientId) }.count
             let registrationEvent = (socket, ServerEvent(type: "client.subscribers", subscribersCount: subscribersCount))
@@ -191,6 +199,10 @@ private final class LiveLocationHub: @unchecked Sendable {
         }
     }
 
+    func isActive(clientId: String) -> Bool {
+        self.state.withLockedValue { $0.activeSessions[clientId] != nil }
+    }
+
     func publish(connectionId: UUID, clientId: String, payload: LocationPayload) -> [(WebSocket, ServerEvent)]? {
         let now = Date()
         let result = self.state.withLockedValue { state -> (UUID?, (latitude: Double, longitude: Double, time: Date)?, [(WebSocket, ServerEvent)]?) in
@@ -211,7 +223,8 @@ private final class LiveLocationHub: @unchecked Sendable {
                 .filter { $0.subscriptions.contains(clientId) }
                 .map { ($0.socket, event) }
 
-            state.lastSeenREST[clientId] = now
+            state.lastActivity[clientId] = now
+            state.lastTransport[clientId] = .rest
 
             return (state.activeSessions[clientId], state.lastSavedPoints[clientId], adminEvents)
         }
@@ -294,7 +307,8 @@ private final class LiveLocationHub: @unchecked Sendable {
                 .filter { $0.subscriptions.contains(clientId) }
                 .map { ($0.socket, event) }
 
-            state.lastSeenREST[clientId] = now
+            state.lastActivity[clientId] = now
+            state.lastTransport[clientId] = .rest
 
             return (state.activeSessions[clientId], state.lastSavedPoints[clientId], adminEvents)
         }
@@ -348,22 +362,41 @@ private final class LiveLocationHub: @unchecked Sendable {
         return adminEvents
     }
 
-    func cleanupRESTSessions() async {
+    func cleanupSessions() async {
         let now = Date()
-        let timeout: TimeInterval = 60
+        
+        let restTimeout: TimeInterval = 60 
+        let sessionTimeout: TimeInterval = 2 * 3600 
 
-        let expiredClientIds = self.state.withLockedValue { state -> [String] in
-            state.lastSeenREST.filter { now.timeIntervalSince($0.value) > timeout }.map { $0.key }
-        }
+        let stateSnapshot = self.state.withLockedValue { $0 }
+        
+        // 1. Identify Expired Clients
+        let expiredClientIds = stateSnapshot.lastActivity.filter { clientId, lastSeen in
+            // If the client is currently connected via WebSocket, don't timeout.
+            let isConnected = stateSnapshot.clientByConnection.values.contains(clientId)
+            if isConnected { return false }
+            
+            // Transport-aware timeout logic
+            let transport = stateSnapshot.lastTransport[clientId] ?? .websocket
+            let timeout = (transport == .rest) ? restTimeout : sessionTimeout
+            
+            return now.timeIntervalSince(lastSeen) > timeout
+        }.map { $0.key }
 
         for clientId in expiredClientIds {
-            print("⏱️ REST Heartbeat timeout for \(clientId). Cleaning up...")
+            print("⏱️ Session timeout for \(clientId). Cleaning up...")
 
             // Mark as offline and notify admins
             let adminEvents = self.state.withLockedValue { state -> [(WebSocket, ServerEvent)] in
-                state.lastSeenREST.removeValue(forKey: clientId)
+                state.lastActivity.removeValue(forKey: clientId)
+                state.lastTransport.removeValue(forKey: clientId)
 
                 guard var location = state.latestLocations[clientId] else { return [] }
+                // Only mark offline if they are currently marked as online
+                if !location.isOnline { 
+                    return [] 
+                }
+                
                 location = StoredLocation(
                     clientId: clientId,
                     latitude: location.latitude,
@@ -386,10 +419,10 @@ private final class LiveLocationHub: @unchecked Sendable {
             // Close tracking session in DB
             do {
                 if let sessionId = try await stopTracking(clientId: clientId) {
-                    print("✅ Closed REST session \(sessionId) for \(clientId)")
+                    print("✅ Closed timed-out session \(sessionId) for \(clientId)")
                 }
             } catch {
-                print("❌ Failed to close REST session for \(clientId): \(error)")
+                print("❌ Failed to close session for \(clientId): \(error)")
             }
         }
     }
@@ -399,7 +432,7 @@ private final class LiveLocationHub: @unchecked Sendable {
 
         // Mark as offline and notify admins
         let adminEvents = self.state.withLockedValue { state -> [(WebSocket, ServerEvent)] in
-            state.lastSeenREST.removeValue(forKey: clientId)
+            state.lastActivity.removeValue(forKey: clientId)
 
             guard var location = state.latestLocations[clientId] else {
                 print("⚠️ No latest location for \(clientId) to mark offline.")
@@ -589,13 +622,10 @@ private func fetchHistory(req: Request, clientId: String?) async throws -> Histo
         sessionQuery = sessionQuery.filter(\.$client.$id == clientId)
     }
 
-    // A session is "in range" if it overlaps [from, to] at all:
-    // session.startTime <= to  AND  (session.endTime >= from OR session.endTime is nil, i.e. still active)
+    // A session is "in range" if its start time falls within the window.
+    // If no window is provided, we return everything sorted by latest first.
     if let fromStr = query.from, let fromDate = fromStr.iso8601Date {
-        sessionQuery = sessionQuery.group(.or) { group in
-            group.filter(\.$endTime >= fromDate)
-            group.filter(\.$endTime == nil)
-        }
+        sessionQuery = sessionQuery.filter(\.$startTime >= fromDate)
     }
     if let toStr = query.to, let toDate = toStr.iso8601Date {
         sessionQuery = sessionQuery.filter(\.$startTime <= toDate)
@@ -624,11 +654,11 @@ private func fetchHistory(req: Request, clientId: String?) async throws -> Histo
 func routes(_ app: Application) throws {
     let hub = LiveLocationHub(db: app.db)
 
-    // --- Background Cleanup Loop for REST Sessions ---
+    // --- Background Cleanup Loop for Tracking Sessions ---
     Task {
         while true {
             try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
-            await hub.cleanupRESTSessions()
+            await hub.cleanupSessions()
         }
     }
 
@@ -731,6 +761,7 @@ func routes(_ app: Application) throws {
         guard let clientId = req.parameters.get("clientId") else {
             throw Abort(.badRequest)
         }
+        // Explicitly clear from active registry and close in DB
         try await hub.stopREST(clientId: clientId)
         return "ok"
     }
@@ -961,11 +992,9 @@ func routes(_ app: Application) throws {
         socket.onClose.whenComplete { _ in
             let result = hub.remove(connectionId: connectionId)
             result.events.forEach { send($0.1, to: $0.0) }
-            if let clientId = result.clientId {
-                Task {
-                    try? await hub.stopTracking(clientId: clientId)
-                }
-            }
+            // --- FIXED: No longer stop tracking immediately on WebSocket close. ---
+            // The session will remain active to survive temporary network loss.
+            // It will only be closed by a manual "Stop" or the 2-hour background timeout.
         }
 
         socket.onText { socket, text in
@@ -991,11 +1020,16 @@ func routes(_ app: Application) throws {
                     return
                 }
 
-                // --- NEW: Automatically start tracking session on registration ---
+                // --- FIXED: Only start tracking if NO active session exists for this client ---
                 Task {
                     do {
-                        let sessionId = try await hub.startTracking(clientId: clientId, sessionTag: incoming.sessionTag)
-                        print("🚀 Automatic tracking started for \(clientId). Session: \(sessionId)")
+                        let alreadyTracking = hub.isActive(clientId: clientId)
+                        if !alreadyTracking {
+                            let sessionId = try await hub.startTracking(clientId: clientId, sessionTag: incoming.sessionTag)
+                            print("🚀 Automatic tracking started for \(clientId). Session: \(sessionId)")
+                        } else {
+                            print("ℹ️ Client \(clientId) is already being tracked in an existing session.")
+                        }
                     } catch {
                         print("❌ Failed to start automatic tracking: \(error)")
                     }
@@ -1003,6 +1037,13 @@ func routes(_ app: Application) throws {
 
                 send(ServerEvent(type: "client.registered", clientId: clientId), to: socket)
                 events.forEach { send($0.1, to: $0.0) }
+
+            case "client.stop_tracking":
+                guard let clientId = incoming.clientId else { return }
+                Task {
+                    _ = try await hub.stopTracking(clientId: clientId)
+                    print("🛑 Client \(clientId) explicitly stopped tracking via WebSocket.")
+                }
 
             case "client.location":
                 guard let clientId = incoming.clientId,
